@@ -1,0 +1,140 @@
+# Publica l'app d'escriptori sola cada vegada que l'ERP canvia a main.
+# Viu en aquest repositori perquè és públic: aquí GitHub Actions és gratis. El codi el baixa amb una clau només de lectura.
+name: Publica l'app d'escriptori
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Publica encara que main no hagi canviat'
+        type: boolean
+        default: false
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  mira:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.c.outputs.sha }}
+      nou: ${{ steps.c.outputs.nou }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.ERP_DEPLOY_KEY }}
+      - id: c
+        shell: bash
+        run: |
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          SHA="$(git ls-remote git@github.com:benjaminzaragoza/Ebresync.git refs/heads/main | cut -f1)"
+          [ -n "$SHA" ] || { echo "No s'ha pogut llegir main"; exit 1; }
+          LAST="$(cat last_built_sha.txt 2>/dev/null || true)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          if [ "$SHA" != "$LAST" ] || [ "${{ inputs.force }}" = "true" ]; then echo "nou=true" >> "$GITHUB_OUTPUT"; else echo "nou=false" >> "$GITHUB_OUTPUT"; fi
+
+  publica:
+    needs: mira
+    if: needs.mira.outputs.nou == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: updates
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.ERP_DEPLOY_KEY }}
+      - name: Baixa l'ERP
+        shell: bash
+        run: |
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone --depth 1 git@github.com:benjaminzaragoza/Ebresync.git app
+          cd app && git fetch --depth 1 origin "${{ needs.mira.outputs.sha }}" && git checkout -q "${{ needs.mira.outputs.sha }}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/src-tauri/target
+          key: cargo-${{ hashFiles('app/src-tauri/Cargo.lock') }}
+          restore-keys: cargo-
+      - name: Instal·la dependències
+        working-directory: app
+        run: npm ci
+      # Mai publicar una compilació trencada (la 0.1.9 va sortir en blanc).
+      - name: Comprova el codi
+        working-directory: app
+        run: npx tsc -p tsconfig.app.json --noEmit
+      - name: Comprova que no surt en blanc
+        working-directory: app
+        run: npx vitest run src/test/TauriNoServiceWorker.test.ts
+      - name: Tria la versió
+        id: ver
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LAST="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          LAST="${LAST#v}"
+          VER="${LAST%.*}.$(( ${LAST##*.} + 1 ))"
+          echo "v=$VER" >> "$GITHUB_OUTPUT"
+          echo "Versió $VER"
+          cd app
+          node -e "const f='src-tauri/tauri.conf.json',fs=require('fs'),j=JSON.parse(fs.readFileSync(f,'utf8'));j.version='$VER';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+      - name: Compila i signa
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: npx tauri build
+      - name: Comprova l'instal·lador i prepara latest.json
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.v }}"
+          B="app/src-tauri/target/release/bundle/nsis"
+          EXE="$B/ebresync_${VER}_x64-setup.exe"
+          [ -f "$EXE" ] && [ -f "$EXE.sig" ] || { echo "Falta l'instal·lador o la signatura"; exit 1; }
+          MB=$(( $(stat -c%s "$EXE") / 1048576 ))
+          echo "Instal·lador: $MB MB"
+          # Un instal·lador sa fa entre 5 i 80 MB: fora d'aquí és una compilació trencada o inflada.
+          [ "$MB" -ge 5 ] && [ "$MB" -le 80 ] || { echo "Mida fora de rang: no es publica"; exit 1; }
+          [ "$(head -c2 "$EXE")" = "MZ" ] || { echo "No és un executable de Windows"; exit 1; }
+          mkdir pub
+          cp "$EXE" "pub/ebresync_${VER}_x64-setup.exe"
+          cp "$EXE" pub/ebresync-setup.exe
+          SIG="$(cat "$EXE.sig")" VER="$VER" REPO="$GITHUB_REPOSITORY" node -e "
+            const j={version:process.env.VER,notes:'Millores i correccions.',pub_date:new Date().toISOString(),
+              platforms:{'windows-x86_64':{signature:process.env.SIG.trim(),url:'https://github.com/'+process.env.REPO+'/releases/download/v'+process.env.VER+'/ebresync_'+process.env.VER+'_x64-setup.exe'}}};
+            require('fs').writeFileSync('pub/latest.json',JSON.stringify(j,null,2));"
+      - name: Publica
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="${{ steps.ver.outputs.v }}"
+          gh release create "v$VER" --repo "$GITHUB_REPOSITORY" --title "v$VER" --notes "Millores i correccions. ERP ${{ needs.mira.outputs.sha }}" pub/ebresync_${VER}_x64-setup.exe pub/ebresync-setup.exe pub/latest.json
+      # També si ha fallat: no es torna a provar el mateix cada 30 minuts. Torna a provar amb el següent canvi, o a mà amb «force».
+      - name: Apunta què s'ha provat
+        if: always()
+        shell: bash
+        working-directory: updates
+        run: |
+          echo "${{ needs.mira.outputs.sha }}" > last_built_sha.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last_built_sha.txt
+          git commit -m "main ${{ needs.mira.outputs.sha }}" || exit 0
+          git pull --rebase origin main && git push origin HEAD:main
